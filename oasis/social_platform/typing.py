@@ -48,6 +48,18 @@ class ActionType(Enum):
     CREATE_GROUP = "create_group"
     LISTEN_FROM_GROUP = "listen_from_group"
 
+    # Facebook-style actions
+    SEND_FRIEND_REQUEST = "send_friend_request"
+    ACCEPT_FRIEND_REQUEST = "accept_friend_request"
+    REJECT_FRIEND_REQUEST = "reject_friend_request"
+    UNFRIEND = "unfriend"
+    GET_FRIEND_REQUESTS = "get_friend_requests"
+    GET_FRIENDS = "get_friends"
+    REACT_TO_POST = "react_to_post"
+    REMOVE_REACTION = "remove_reaction"
+    CREATE_GROUP_POST = "create_group_post"
+    SHARE_TO_GROUP = "share_to_group"
+
     @classmethod
     def get_default_twitter_actions(cls):
         return [
@@ -77,12 +89,29 @@ class ActionType(Enum):
             cls.MUTE,
         ]
 
+    @classmethod
+    def get_default_facebook_actions(cls):
+        """Get default actions for Facebook-style platform."""
+        return [
+            cls.CREATE_POST,
+            cls.CREATE_GROUP_POST,
+            cls.REACT_TO_POST,
+            cls.SEND_FRIEND_REQUEST,
+            cls.ACCEPT_FRIEND_REQUEST,
+            cls.CREATE_COMMENT,
+            cls.JOIN_GROUP,
+            cls.SHARE_TO_GROUP,
+            cls.REFRESH,
+            cls.DO_NOTHING,
+        ]
+
 
 class RecsysType(Enum):
     TWITTER = "twitter"
     TWHIN = "twhin-bert"
     REDDIT = "reddit"
     RANDOM = "random"
+    FACEBOOK = "facebook"  # Prioritizes friends + group content
 
 
 class DefaultPlatformType(Enum):

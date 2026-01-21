@@ -39,6 +39,12 @@ GROUP_SCHEMA_SQL = "chat_group.sql"
 GROUP_MEMBER_SCHEMA_SQL = "group_member.sql"
 GROUP_MESSAGE_SCHEMA_SQL = "group_message.sql"
 
+# Facebook-style schema files
+FRIEND_REQUEST_SCHEMA_SQL = "friend_request.sql"
+FRIENDSHIP_SCHEMA_SQL = "friendship.sql"
+REACTION_SCHEMA_SQL = "reaction.sql"
+GROUP_POST_SCHEMA_SQL = "group_post.sql"
+
 TABLE_NAMES = {
     "user",
     "post",
@@ -56,6 +62,11 @@ TABLE_NAMES = {
     "group",
     "group_member",
     "group_message",
+    # Facebook-style tables
+    "friend_request",
+    "friendship",
+    "reaction",
+    "group_post",
 }
 
 
@@ -191,6 +202,32 @@ def create_db(db_path: str | None = None):
         with open(group_message_sql_path, "r") as sql_file:
             group_message_sql_script = sql_file.read()
         cursor.executescript(group_message_sql_script)
+
+        # Facebook-style tables:
+
+        # Read and execute the friend_request table SQL script:
+        friend_request_sql_path = osp.join(schema_dir, FRIEND_REQUEST_SCHEMA_SQL)
+        with open(friend_request_sql_path, "r") as sql_file:
+            friend_request_sql_script = sql_file.read()
+        cursor.executescript(friend_request_sql_script)
+
+        # Read and execute the friendship table SQL script:
+        friendship_sql_path = osp.join(schema_dir, FRIENDSHIP_SCHEMA_SQL)
+        with open(friendship_sql_path, "r") as sql_file:
+            friendship_sql_script = sql_file.read()
+        cursor.executescript(friendship_sql_script)
+
+        # Read and execute the reaction table SQL script:
+        reaction_sql_path = osp.join(schema_dir, REACTION_SCHEMA_SQL)
+        with open(reaction_sql_path, "r") as sql_file:
+            reaction_sql_script = sql_file.read()
+        cursor.executescript(reaction_sql_script)
+
+        # Read and execute the group_post table SQL script:
+        group_post_sql_path = osp.join(schema_dir, GROUP_POST_SCHEMA_SQL)
+        with open(group_post_sql_path, "r") as sql_file:
+            group_post_sql_script = sql_file.read()
+        cursor.executescript(group_post_sql_script)
 
         # Commit the changes:
         conn.commit()

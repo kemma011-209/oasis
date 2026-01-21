@@ -57,6 +57,17 @@ class SocialAction:
                 self.send_to_group,
                 self.create_group,
                 self.listen_from_group,
+                # Facebook-style actions
+                self.send_friend_request,
+                self.accept_friend_request,
+                self.reject_friend_request,
+                self.unfriend,
+                self.get_friend_requests,
+                self.get_friends,
+                self.react_to_post,
+                self.remove_reaction,
+                self.create_group_post,
+                self.share_to_group,
             ]
         ]
 
@@ -756,3 +767,179 @@ class SocialAction:
         r"""Listen messages from groups"""
         return await self.perform_action(self.agent_id,
                                          ActionType.LISTEN_FROM_GROUP.value)
+
+    # ==================== Facebook-style actions ====================
+
+    async def send_friend_request(self, user_id: int):
+        r"""Send a friend request to another user (Facebook-style).
+
+        This creates a pending friend request that the other user can
+        accept or reject. If the other user has already sent you a
+        request, this will auto-accept and create a mutual friendship.
+
+        Args:
+            user_id (int): The ID of the user to send a friend request to.
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "request_id": 123}
+        """
+        return await self.perform_action(user_id,
+                                         ActionType.SEND_FRIEND_REQUEST.value)
+
+    async def accept_friend_request(self, request_id: int):
+        r"""Accept a pending friend request.
+
+        This creates a mutual friendship between you and the sender.
+
+        Args:
+            request_id (int): The ID of the friend request to accept.
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "friendship_id": 456}
+        """
+        return await self.perform_action(request_id,
+                                         ActionType.ACCEPT_FRIEND_REQUEST.value)
+
+    async def reject_friend_request(self, request_id: int):
+        r"""Reject a pending friend request.
+
+        Args:
+            request_id (int): The ID of the friend request to reject.
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "request_id": 123}
+        """
+        return await self.perform_action(request_id,
+                                         ActionType.REJECT_FRIEND_REQUEST.value)
+
+    async def unfriend(self, user_id: int):
+        r"""Remove a mutual friendship with another user.
+
+        Args:
+            user_id (int): The ID of the friend to unfriend.
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "friendship_id": 456}
+        """
+        return await self.perform_action(user_id, ActionType.UNFRIEND.value)
+
+    async def get_friend_requests(self):
+        r"""Get pending friend requests (both incoming and outgoing).
+
+        Returns:
+            dict: Platform response with lists of incoming and outgoing requests.
+
+            Example of a successful return:
+            {
+                "success": True,
+                "incoming": [{"request_id": 1, "sender_id": 5, ...}],
+                "outgoing": [{"request_id": 2, "receiver_id": 10, ...}]
+            }
+        """
+        return await self.perform_action(None,
+                                         ActionType.GET_FRIEND_REQUESTS.value)
+
+    async def get_friends(self):
+        r"""Get list of all friends.
+
+        Returns:
+            dict: Platform response with list of friends.
+
+            Example of a successful return:
+            {
+                "success": True,
+                "friends": [
+                    {"user_id": 5, "user_name": "john", "name": "John Doe", ...}
+                ]
+            }
+        """
+        return await self.perform_action(None, ActionType.GET_FRIENDS.value)
+
+    async def react_to_post(self, post_id: int, reaction_type: str):
+        r"""React to a post with a specific reaction type (Facebook-style).
+
+        Available reactions: 'like', 'love', 'haha', 'wow', 'sad', 'angry'
+
+        If you have already reacted to this post, your reaction will be
+        updated to the new type.
+
+        Args:
+            post_id (int): The ID of the post to react to.
+            reaction_type (str): The type of reaction. Must be one of:
+                'like', 'love', 'haha', 'wow', 'sad', 'angry'
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "reaction_id": 789}
+
+            If updating an existing reaction:
+            {"success": True, "reaction_id": 789, "updated": True}
+        """
+        return await self.perform_action((post_id, reaction_type),
+                                         ActionType.REACT_TO_POST.value)
+
+    async def remove_reaction(self, post_id: int):
+        r"""Remove your reaction from a post.
+
+        Args:
+            post_id (int): The ID of the post to remove your reaction from.
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "reaction_id": 789}
+        """
+        return await self.perform_action(post_id,
+                                         ActionType.REMOVE_REACTION.value)
+
+    async def create_group_post(self, group_id: int, content: str):
+        r"""Create a post visible only to members of a specific group.
+
+        You must be a member of the group to create a post in it.
+
+        Args:
+            group_id (int): The ID of the group to post in.
+            content (str): The content of the post.
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "post_id": 100, "group_post_id": 50}
+        """
+        return await self.perform_action((group_id, content),
+                                         ActionType.CREATE_GROUP_POST.value)
+
+    async def share_to_group(self, post_id: int, group_id: int):
+        r"""Share an existing post to a group.
+
+        This makes the post visible to all members of the group.
+        You must be a member of the group to share a post to it.
+
+        Args:
+            post_id (int): The ID of the post to share.
+            group_id (int): The ID of the group to share to.
+
+        Returns:
+            dict: Platform response indicating success or failure.
+
+            Example of a successful return:
+            {"success": True, "group_post_id": 51}
+        """
+        return await self.perform_action((post_id, group_id),
+                                         ActionType.SHARE_TO_GROUP.value)

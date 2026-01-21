@@ -264,6 +264,11 @@ class Platform:
             current_time = self.sandbox_clock.get_time_step()
         try:
             user_id = agent_id
+
+            # Facebook-style feed: friends' posts + group posts
+            if self.recsys_type == RecsysType.FACEBOOK:
+                return await self._refresh_facebook_style(user_id, current_time)
+
             # Retrieve all post_ids for a given user_id from the rec table
             rec_query = "SELECT post_id FROM rec WHERE user_id = ?"
             self.pl_utils._execute_db_command(rec_query, (user_id, ))
@@ -318,6 +323,89 @@ class Platform:
 
             action_info = {"posts": results_with_comments}
             # twitter_log.info(action_info)
+            self.pl_utils._record_trace(user_id, ActionType.REFRESH.value,
+                                        action_info, current_time)
+
+            return {"success": True, "posts": results_with_comments}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def _refresh_facebook_style(self, user_id: int, current_time):
+        """Facebook-style refresh: friends' posts + group posts combined."""
+        try:
+            selected_post_ids = []
+
+            # Get posts from friends (mutual connections via friendship table)
+            # Excludes group-only posts (posts that are ONLY in group_post table)
+            friend_posts_query = """
+                SELECT DISTINCT p.post_id
+                FROM post p
+                JOIN friendship f ON 
+                    (f.user_id_1 = p.user_id AND f.user_id_2 = ?) OR
+                    (f.user_id_2 = p.user_id AND f.user_id_1 = ?)
+                WHERE p.post_id NOT IN (
+                    SELECT gp.post_id FROM group_post gp
+                    WHERE gp.group_id NOT IN (
+                        SELECT gm.group_id FROM group_members gm WHERE gm.agent_id = ?
+                    )
+                )
+                ORDER BY p.created_at DESC
+                LIMIT ?
+            """
+            self.pl_utils._execute_db_command(
+                friend_posts_query, 
+                (user_id, user_id, user_id, self.following_post_count))
+            friend_post_ids = [row[0] for row in self.db_cursor.fetchall()]
+            selected_post_ids.extend(friend_post_ids)
+
+            # Get posts from groups user is a member of
+            group_posts_query = """
+                SELECT DISTINCT p.post_id
+                FROM post p
+                JOIN group_post gp ON p.post_id = gp.post_id
+                JOIN group_members gm ON gp.group_id = gm.group_id
+                WHERE gm.agent_id = ?
+                ORDER BY p.created_at DESC
+                LIMIT ?
+            """
+            self.pl_utils._execute_db_command(
+                group_posts_query, (user_id, self.refresh_rec_post_count))
+            group_post_ids = [row[0] for row in self.db_cursor.fetchall()]
+            selected_post_ids.extend(group_post_ids)
+
+            # Get user's own posts
+            own_posts_query = """
+                SELECT post_id FROM post 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC 
+                LIMIT 5
+            """
+            self.pl_utils._execute_db_command(own_posts_query, (user_id,))
+            own_post_ids = [row[0] for row in self.db_cursor.fetchall()]
+            selected_post_ids.extend(own_post_ids)
+
+            # Remove duplicates while preserving some order
+            selected_post_ids = list(dict.fromkeys(selected_post_ids))
+
+            if not selected_post_ids:
+                return {"success": False, "message": "No posts found."}
+
+            # Fetch full post data
+            placeholders = ", ".join("?" for _ in selected_post_ids)
+            post_query = (
+                f"SELECT post_id, user_id, original_post_id, content, "
+                f"quote_content, created_at, num_likes, num_dislikes, "
+                f"num_shares FROM post WHERE post_id IN ({placeholders}) "
+                f"ORDER BY created_at DESC")
+            self.pl_utils._execute_db_command(post_query, selected_post_ids)
+            results = self.db_cursor.fetchall()
+
+            if not results:
+                return {"success": False, "message": "No posts found."}
+
+            results_with_comments = self.pl_utils._add_comments_to_posts(results)
+
+            action_info = {"posts": results_with_comments, "feed_type": "facebook"}
             self.pl_utils._record_trace(user_id, ActionType.REFRESH.value,
                                         action_info, current_time)
 
@@ -1638,5 +1726,456 @@ class Platform:
                 "joined_groups": joined_group_ids,
                 "messages": messages
             }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ==================== Facebook-style methods ====================
+
+    def _get_current_time(self):
+        """Helper method to get current time based on recsys type."""
+        if self.recsys_type == RecsysType.REDDIT:
+            return self.sandbox_clock.time_transfer(
+                datetime.now(), self.start_time)
+        else:
+            return self.sandbox_clock.get_time_step()
+
+    async def send_friend_request(self, agent_id: int, receiver_id: int):
+        """Send a friend request to another user (Facebook-style)."""
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Cannot send friend request to self
+            if user_id == receiver_id:
+                return {"success": False, "error": "Cannot send friend request to yourself."}
+
+            # Check if already friends
+            friendship_check = """
+                SELECT * FROM friendship 
+                WHERE (user_id_1 = ? AND user_id_2 = ?) 
+                   OR (user_id_1 = ? AND user_id_2 = ?)
+            """
+            self.pl_utils._execute_db_command(
+                friendship_check, (user_id, receiver_id, receiver_id, user_id))
+            if self.db_cursor.fetchone():
+                return {"success": False, "error": "Already friends."}
+
+            # Check if request already exists (pending)
+            request_check = """
+                SELECT * FROM friend_request 
+                WHERE sender_id = ? AND receiver_id = ? AND status = 'pending'
+            """
+            self.pl_utils._execute_db_command(request_check, (user_id, receiver_id))
+            if self.db_cursor.fetchone():
+                return {"success": False, "error": "Friend request already pending."}
+
+            # Check if receiver already sent a request to sender
+            reverse_check = """
+                SELECT request_id FROM friend_request 
+                WHERE sender_id = ? AND receiver_id = ? AND status = 'pending'
+            """
+            self.pl_utils._execute_db_command(reverse_check, (receiver_id, user_id))
+            reverse_request = self.db_cursor.fetchone()
+            if reverse_request:
+                # Auto-accept if there's a pending request from the other side
+                return await self.accept_friend_request(user_id, reverse_request[0])
+
+            # Insert friend request
+            insert_query = """
+                INSERT INTO friend_request (sender_id, receiver_id, status, created_at)
+                VALUES (?, ?, 'pending', ?)
+            """
+            self.pl_utils._execute_db_command(
+                insert_query, (user_id, receiver_id, current_time), commit=True)
+            request_id = self.db_cursor.lastrowid
+
+            action_info = {"receiver_id": receiver_id, "request_id": request_id}
+            self.pl_utils._record_trace(user_id, ActionType.SEND_FRIEND_REQUEST.value,
+                                        action_info, current_time)
+
+            return {"success": True, "request_id": request_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def accept_friend_request(self, agent_id: int, request_id: int):
+        """Accept a friend request, creating mutual friendship."""
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Verify request exists and is for this user
+            request_check = """
+                SELECT sender_id FROM friend_request 
+                WHERE request_id = ? AND receiver_id = ? AND status = 'pending'
+            """
+            self.pl_utils._execute_db_command(request_check, (request_id, user_id))
+            result = self.db_cursor.fetchone()
+            if not result:
+                return {"success": False, "error": "Friend request not found or already processed."}
+
+            sender_id = result[0]
+
+            # Update request status
+            update_query = """
+                UPDATE friend_request SET status = 'accepted', responded_at = ?
+                WHERE request_id = ?
+            """
+            self.pl_utils._execute_db_command(
+                update_query, (current_time, request_id), commit=True)
+
+            # Create mutual friendship (store with lower ID first for consistency)
+            user_1, user_2 = min(user_id, sender_id), max(user_id, sender_id)
+            friendship_insert = """
+                INSERT INTO friendship (user_id_1, user_id_2, created_at)
+                VALUES (?, ?, ?)
+            """
+            self.pl_utils._execute_db_command(
+                friendship_insert, (user_1, user_2, current_time), commit=True)
+            friendship_id = self.db_cursor.lastrowid
+
+            # Update friend counts for both users (using num_followers as friend count)
+            update_count = "UPDATE user SET num_followers = num_followers + 1 WHERE user_id = ?"
+            self.pl_utils._execute_db_command(update_count, (user_id,), commit=True)
+            self.pl_utils._execute_db_command(update_count, (sender_id,), commit=True)
+
+            action_info = {"request_id": request_id, "friendship_id": friendship_id, 
+                          "friend_id": sender_id}
+            self.pl_utils._record_trace(user_id, ActionType.ACCEPT_FRIEND_REQUEST.value,
+                                        action_info, current_time)
+
+            return {"success": True, "friendship_id": friendship_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def reject_friend_request(self, agent_id: int, request_id: int):
+        """Reject a friend request."""
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Verify request exists and is for this user
+            request_check = """
+                SELECT sender_id FROM friend_request 
+                WHERE request_id = ? AND receiver_id = ? AND status = 'pending'
+            """
+            self.pl_utils._execute_db_command(request_check, (request_id, user_id))
+            result = self.db_cursor.fetchone()
+            if not result:
+                return {"success": False, "error": "Friend request not found or already processed."}
+
+            # Update request status
+            update_query = """
+                UPDATE friend_request SET status = 'rejected', responded_at = ?
+                WHERE request_id = ?
+            """
+            self.pl_utils._execute_db_command(
+                update_query, (current_time, request_id), commit=True)
+
+            action_info = {"request_id": request_id}
+            self.pl_utils._record_trace(user_id, ActionType.REJECT_FRIEND_REQUEST.value,
+                                        action_info, current_time)
+
+            return {"success": True, "request_id": request_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def unfriend(self, agent_id: int, friend_id: int):
+        """Remove a mutual friendship."""
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Find the friendship record
+            user_1, user_2 = min(user_id, friend_id), max(user_id, friend_id)
+            friendship_check = """
+                SELECT friendship_id FROM friendship 
+                WHERE user_id_1 = ? AND user_id_2 = ?
+            """
+            self.pl_utils._execute_db_command(friendship_check, (user_1, user_2))
+            result = self.db_cursor.fetchone()
+            if not result:
+                return {"success": False, "error": "Friendship not found."}
+
+            friendship_id = result[0]
+
+            # Delete the friendship
+            delete_query = "DELETE FROM friendship WHERE friendship_id = ?"
+            self.pl_utils._execute_db_command(delete_query, (friendship_id,), commit=True)
+
+            # Update friend counts for both users
+            update_count = "UPDATE user SET num_followers = num_followers - 1 WHERE user_id = ?"
+            self.pl_utils._execute_db_command(update_count, (user_id,), commit=True)
+            self.pl_utils._execute_db_command(update_count, (friend_id,), commit=True)
+
+            action_info = {"friend_id": friend_id, "friendship_id": friendship_id}
+            self.pl_utils._record_trace(user_id, ActionType.UNFRIEND.value,
+                                        action_info, current_time)
+
+            return {"success": True, "friendship_id": friendship_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_friend_requests(self, agent_id: int):
+        """Get pending friend requests for a user."""
+        try:
+            user_id = agent_id
+
+            # Get incoming requests
+            incoming_query = """
+                SELECT fr.request_id, fr.sender_id, u.user_name, u.name, fr.created_at
+                FROM friend_request fr
+                JOIN user u ON fr.sender_id = u.user_id
+                WHERE fr.receiver_id = ? AND fr.status = 'pending'
+                ORDER BY fr.created_at DESC
+            """
+            self.pl_utils._execute_db_command(incoming_query, (user_id,))
+            incoming = [{
+                "request_id": row[0],
+                "sender_id": row[1],
+                "sender_username": row[2],
+                "sender_name": row[3],
+                "created_at": row[4]
+            } for row in self.db_cursor.fetchall()]
+
+            # Get outgoing requests
+            outgoing_query = """
+                SELECT fr.request_id, fr.receiver_id, u.user_name, u.name, fr.created_at
+                FROM friend_request fr
+                JOIN user u ON fr.receiver_id = u.user_id
+                WHERE fr.sender_id = ? AND fr.status = 'pending'
+                ORDER BY fr.created_at DESC
+            """
+            self.pl_utils._execute_db_command(outgoing_query, (user_id,))
+            outgoing = [{
+                "request_id": row[0],
+                "receiver_id": row[1],
+                "receiver_username": row[2],
+                "receiver_name": row[3],
+                "created_at": row[4]
+            } for row in self.db_cursor.fetchall()]
+
+            action_info = {"incoming_count": len(incoming), "outgoing_count": len(outgoing)}
+            self.pl_utils._record_trace(user_id, ActionType.GET_FRIEND_REQUESTS.value,
+                                        action_info)
+
+            return {"success": True, "incoming": incoming, "outgoing": outgoing}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_friends(self, agent_id: int):
+        """Get list of friends for a user."""
+        try:
+            user_id = agent_id
+
+            friends_query = """
+                SELECT 
+                    CASE WHEN f.user_id_1 = ? THEN f.user_id_2 ELSE f.user_id_1 END as friend_id,
+                    u.user_name, u.name, u.bio, f.created_at as friends_since
+                FROM friendship f
+                JOIN user u ON u.user_id = CASE WHEN f.user_id_1 = ? THEN f.user_id_2 ELSE f.user_id_1 END
+                WHERE f.user_id_1 = ? OR f.user_id_2 = ?
+                ORDER BY f.created_at DESC
+            """
+            self.pl_utils._execute_db_command(friends_query, (user_id, user_id, user_id, user_id))
+            friends = [{
+                "user_id": row[0],
+                "user_name": row[1],
+                "name": row[2],
+                "bio": row[3],
+                "friends_since": row[4]
+            } for row in self.db_cursor.fetchall()]
+
+            action_info = {"friend_count": len(friends)}
+            self.pl_utils._record_trace(user_id, ActionType.GET_FRIENDS.value, action_info)
+
+            return {"success": True, "friends": friends}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def react_to_post(self, agent_id: int, reaction_message: tuple):
+        """React to a post with a specific reaction type (Facebook-style)."""
+        post_id, reaction_type = reaction_message
+        valid_reactions = ['like', 'love', 'haha', 'wow', 'sad', 'angry']
+
+        if reaction_type not in valid_reactions:
+            return {"success": False, "error": f"Invalid reaction. Use: {valid_reactions}"}
+
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Handle repost - react to original
+            post_type_result = self.pl_utils._get_post_type(post_id)
+            if post_type_result and post_type_result['type'] == 'repost':
+                post_id = post_type_result['root_post_id']
+
+            # Check if user already reacted
+            check_query = "SELECT reaction_id, reaction_type FROM reaction WHERE post_id = ? AND user_id = ?"
+            self.pl_utils._execute_db_command(check_query, (post_id, user_id))
+            existing = self.db_cursor.fetchone()
+
+            if existing:
+                # Update existing reaction
+                update_query = """
+                    UPDATE reaction SET reaction_type = ?, created_at = ?
+                    WHERE post_id = ? AND user_id = ?
+                """
+                self.pl_utils._execute_db_command(
+                    update_query, (reaction_type, current_time, post_id, user_id), commit=True)
+                
+                action_info = {"post_id": post_id, "reaction_type": reaction_type, 
+                              "previous_reaction": existing[1], "updated": True}
+                self.pl_utils._record_trace(user_id, ActionType.REACT_TO_POST.value,
+                                            action_info, current_time)
+                return {"success": True, "reaction_id": existing[0], "updated": True}
+            else:
+                # Insert new reaction
+                insert_query = """
+                    INSERT INTO reaction (post_id, user_id, reaction_type, created_at)
+                    VALUES (?, ?, ?, ?)
+                """
+                self.pl_utils._execute_db_command(
+                    insert_query, (post_id, user_id, reaction_type, current_time), commit=True)
+                reaction_id = self.db_cursor.lastrowid
+
+                # Also increment num_likes for backward compatibility if reaction is 'like'
+                if reaction_type == 'like':
+                    self.pl_utils._execute_db_command(
+                        "UPDATE post SET num_likes = num_likes + 1 WHERE post_id = ?",
+                        (post_id,), commit=True)
+
+                action_info = {"post_id": post_id, "reaction_type": reaction_type, 
+                              "reaction_id": reaction_id}
+                self.pl_utils._record_trace(user_id, ActionType.REACT_TO_POST.value,
+                                            action_info, current_time)
+                return {"success": True, "reaction_id": reaction_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def remove_reaction(self, agent_id: int, post_id: int):
+        """Remove a reaction from a post."""
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Handle repost
+            post_type_result = self.pl_utils._get_post_type(post_id)
+            if post_type_result and post_type_result['type'] == 'repost':
+                post_id = post_type_result['root_post_id']
+
+            # Check if reaction exists
+            check_query = "SELECT reaction_id, reaction_type FROM reaction WHERE post_id = ? AND user_id = ?"
+            self.pl_utils._execute_db_command(check_query, (post_id, user_id))
+            existing = self.db_cursor.fetchone()
+
+            if not existing:
+                return {"success": False, "error": "No reaction found to remove."}
+
+            reaction_id, reaction_type = existing
+
+            # Delete the reaction
+            delete_query = "DELETE FROM reaction WHERE reaction_id = ?"
+            self.pl_utils._execute_db_command(delete_query, (reaction_id,), commit=True)
+
+            # Decrement num_likes if it was a 'like' reaction
+            if reaction_type == 'like':
+                self.pl_utils._execute_db_command(
+                    "UPDATE post SET num_likes = num_likes - 1 WHERE post_id = ?",
+                    (post_id,), commit=True)
+
+            action_info = {"post_id": post_id, "reaction_id": reaction_id, 
+                          "reaction_type": reaction_type}
+            self.pl_utils._record_trace(user_id, ActionType.REMOVE_REACTION.value,
+                                        action_info, current_time)
+
+            return {"success": True, "reaction_id": reaction_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def create_group_post(self, agent_id: int, group_post_message: tuple):
+        """Create a post visible only to group members."""
+        group_id, content = group_post_message
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Check if user is a member of the group
+            check_query = "SELECT * FROM group_members WHERE group_id = ? AND agent_id = ?"
+            self.pl_utils._execute_db_command(check_query, (group_id, user_id))
+            if not self.db_cursor.fetchone():
+                return {"success": False, "error": "User is not a member of this group."}
+
+            # Create the post
+            post_insert_query = (
+                "INSERT INTO post (user_id, content, created_at, num_likes, "
+                "num_dislikes, num_shares, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            self.pl_utils._execute_db_command(
+                post_insert_query, (user_id, content, current_time, 0, 0, 0, 'public'),
+                commit=True)
+            post_id = self.db_cursor.lastrowid
+
+            # Link post to group
+            group_post_insert = """
+                INSERT INTO group_post (group_id, post_id, created_at)
+                VALUES (?, ?, ?)
+            """
+            self.pl_utils._execute_db_command(
+                group_post_insert, (group_id, post_id, current_time), commit=True)
+            group_post_id = self.db_cursor.lastrowid
+
+            action_info = {"group_id": group_id, "post_id": post_id, 
+                          "group_post_id": group_post_id, "content": content}
+            self.pl_utils._record_trace(user_id, ActionType.CREATE_GROUP_POST.value,
+                                        action_info, current_time)
+
+            return {"success": True, "post_id": post_id, "group_post_id": group_post_id}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def share_to_group(self, agent_id: int, share_message: tuple):
+        """Share an existing post to a group."""
+        post_id, group_id = share_message
+        current_time = self._get_current_time()
+        try:
+            user_id = agent_id
+
+            # Check if user is a member of the group
+            check_query = "SELECT * FROM group_members WHERE group_id = ? AND agent_id = ?"
+            self.pl_utils._execute_db_command(check_query, (group_id, user_id))
+            if not self.db_cursor.fetchone():
+                return {"success": False, "error": "User is not a member of this group."}
+
+            # Check if post exists
+            post_check = "SELECT post_id FROM post WHERE post_id = ?"
+            self.pl_utils._execute_db_command(post_check, (post_id,))
+            if not self.db_cursor.fetchone():
+                return {"success": False, "error": "Post not found."}
+
+            # Check if already shared to this group
+            share_check = "SELECT * FROM group_post WHERE group_id = ? AND post_id = ?"
+            self.pl_utils._execute_db_command(share_check, (group_id, post_id))
+            if self.db_cursor.fetchone():
+                return {"success": False, "error": "Post already shared to this group."}
+
+            # Link post to group with sharer info
+            share_insert = """
+                INSERT INTO group_post (group_id, post_id, shared_by, created_at)
+                VALUES (?, ?, ?, ?)
+            """
+            self.pl_utils._execute_db_command(
+                share_insert, (group_id, post_id, user_id, current_time), commit=True)
+            group_post_id = self.db_cursor.lastrowid
+
+            # Update share count
+            self.pl_utils._execute_db_command(
+                "UPDATE post SET num_shares = num_shares + 1 WHERE post_id = ?",
+                (post_id,), commit=True)
+
+            action_info = {"post_id": post_id, "group_id": group_id, 
+                          "group_post_id": group_post_id}
+            self.pl_utils._record_trace(user_id, ActionType.SHARE_TO_GROUP.value,
+                                        action_info, current_time)
+
+            return {"success": True, "group_post_id": group_post_id}
         except Exception as e:
             return {"success": False, "error": str(e)}
