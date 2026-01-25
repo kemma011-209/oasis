@@ -28,7 +28,8 @@ from oasis.social_platform.database import (create_db,
                                             fetch_rec_table_as_matrix,
                                             fetch_table_from_db)
 from oasis.social_platform.platform_utils import PlatformUtils
-from oasis.social_platform.recsys import (rec_sys_personalized_twh,
+from oasis.social_platform.recsys import (rec_sys_facebook_edgerank,
+                                          rec_sys_personalized_twh,
                                           rec_sys_personalized_with_trace,
                                           rec_sys_random, rec_sys_reddit)
 from oasis.social_platform.typing import ActionType, RecsysType
@@ -177,7 +178,7 @@ class Platform:
 
     async def sign_up(self, agent_id, user_message):
         user_name, name, bio = user_message
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -219,7 +220,7 @@ class Platform:
 
     async def purchase_product(self, agent_id, purchase_message):
         product_name, purchase_num = purchase_message
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -257,7 +258,7 @@ class Platform:
 
     async def refresh(self, agent_id: int):
         # Retrieve posts for a specific id from the rec table
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -282,7 +283,7 @@ class Platform:
                 selected_post_ids = random.sample(selected_post_ids,
                                                   self.refresh_rec_post_count)
 
-            if self.recsys_type != RecsysType.REDDIT:
+            if self.recsys_type not in (RecsysType.REDDIT, RecsysType.FACEBOOK):
                 # Retrieve posts from following (in network)
                 # Modify the SQL query so that the refresh gets posts from
                 # people the user follows, sorted by the number of likes on
@@ -331,49 +332,99 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def _refresh_facebook_style(self, user_id: int, current_time):
-        """Facebook-style refresh: friends' posts + group posts combined."""
+        """
+        Facebook-style refresh using EdgeRank-based ranking.
+        
+        Combines friends' posts + group posts, ranked by EdgeRank score
+        (Affinity × Weight × Decay) enhanced with content similarity.
+        
+        Based on: Kincaid (2010), Backstrom et al. (2011)
+        """
         try:
             selected_post_ids = []
 
-            # Get posts from friends (mutual connections via friendship table)
-            # Excludes group-only posts (posts that are ONLY in group_post table)
-            friend_posts_query = """
-                SELECT DISTINCT p.post_id
-                FROM post p
-                JOIN friendship f ON 
-                    (f.user_id_1 = p.user_id AND f.user_id_2 = ?) OR
-                    (f.user_id_2 = p.user_id AND f.user_id_1 = ?)
-                WHERE p.post_id NOT IN (
-                    SELECT gp.post_id FROM group_post gp
-                    WHERE gp.group_id NOT IN (
-                        SELECT gm.group_id FROM group_members gm WHERE gm.agent_id = ?
+            # First, try to get pre-computed EdgeRank recommendations from cache
+            rec_query = """
+                SELECT post_id FROM rec 
+                WHERE user_id = ? 
+                LIMIT ?
+            """
+            self.pl_utils._execute_db_command(
+                rec_query, (user_id, self.max_rec_post_len))
+            rec_post_ids = [row[0] for row in self.db_cursor.fetchall()]
+            
+            # Filter recommendations to only include friends' posts and group posts
+            # This ensures we respect the Facebook social model
+            if rec_post_ids:
+                placeholders = ", ".join("?" for _ in rec_post_ids)
+                
+                # Get recommended posts that are either:
+                # 1. From friends (via friendship table)
+                # 2. From groups user is a member of (via group_post + group_members)
+                # 3. Public posts from non-friends (limited, for discovery)
+                filtered_query = f"""
+                    SELECT DISTINCT p.post_id
+                    FROM post p
+                    WHERE p.post_id IN ({placeholders})
+                    AND (
+                        -- Posts from friends
+                        EXISTS (
+                            SELECT 1 FROM friendship f 
+                            WHERE (f.user_id_1 = p.user_id AND f.user_id_2 = ?)
+                               OR (f.user_id_2 = p.user_id AND f.user_id_1 = ?)
+                        )
+                        -- Posts from groups user is a member of
+                        OR EXISTS (
+                            SELECT 1 FROM group_post gp
+                            JOIN group_members gm ON gp.group_id = gm.group_id
+                            WHERE gp.post_id = p.post_id AND gm.agent_id = ?
+                        )
                     )
-                )
-                ORDER BY p.created_at DESC
-                LIMIT ?
-            """
-            self.pl_utils._execute_db_command(
-                friend_posts_query, 
-                (user_id, user_id, user_id, self.following_post_count))
-            friend_post_ids = [row[0] for row in self.db_cursor.fetchall()]
-            selected_post_ids.extend(friend_post_ids)
+                """
+                params = rec_post_ids + [user_id, user_id, user_id]
+                self.pl_utils._execute_db_command(filtered_query, params)
+                selected_post_ids = [row[0] for row in self.db_cursor.fetchall()]
+            
+            # If no cached recommendations, fall back to chronological
+            if not selected_post_ids:
+                # Get posts from friends (mutual connections via friendship table)
+                friend_posts_query = """
+                    SELECT DISTINCT p.post_id
+                    FROM post p
+                    JOIN friendship f ON 
+                        (f.user_id_1 = p.user_id AND f.user_id_2 = ?) OR
+                        (f.user_id_2 = p.user_id AND f.user_id_1 = ?)
+                    WHERE p.post_id NOT IN (
+                        SELECT gp.post_id FROM group_post gp
+                        WHERE gp.group_id NOT IN (
+                            SELECT gm.group_id FROM group_members gm WHERE gm.agent_id = ?
+                        )
+                    )
+                    ORDER BY p.created_at DESC
+                    LIMIT ?
+                """
+                self.pl_utils._execute_db_command(
+                    friend_posts_query, 
+                    (user_id, user_id, user_id, self.following_post_count))
+                friend_post_ids = [row[0] for row in self.db_cursor.fetchall()]
+                selected_post_ids.extend(friend_post_ids)
 
-            # Get posts from groups user is a member of
-            group_posts_query = """
-                SELECT DISTINCT p.post_id
-                FROM post p
-                JOIN group_post gp ON p.post_id = gp.post_id
-                JOIN group_members gm ON gp.group_id = gm.group_id
-                WHERE gm.agent_id = ?
-                ORDER BY p.created_at DESC
-                LIMIT ?
-            """
-            self.pl_utils._execute_db_command(
-                group_posts_query, (user_id, self.refresh_rec_post_count))
-            group_post_ids = [row[0] for row in self.db_cursor.fetchall()]
-            selected_post_ids.extend(group_post_ids)
+                # Get posts from groups user is a member of
+                group_posts_query = """
+                    SELECT DISTINCT p.post_id
+                    FROM post p
+                    JOIN group_post gp ON p.post_id = gp.post_id
+                    JOIN group_members gm ON gp.group_id = gm.group_id
+                    WHERE gm.agent_id = ?
+                    ORDER BY p.created_at DESC
+                    LIMIT ?
+                """
+                self.pl_utils._execute_db_command(
+                    group_posts_query, (user_id, self.refresh_rec_post_count))
+                group_post_ids = [row[0] for row in self.db_cursor.fetchall()]
+                selected_post_ids.extend(group_post_ids)
 
-            # Get user's own posts
+            # Get user's own posts (always included)
             own_posts_query = """
                 SELECT post_id FROM post 
                 WHERE user_id = ? 
@@ -384,20 +435,28 @@ class Platform:
             own_post_ids = [row[0] for row in self.db_cursor.fetchall()]
             selected_post_ids.extend(own_post_ids)
 
-            # Remove duplicates while preserving some order
+            # Remove duplicates while preserving EdgeRank order
             selected_post_ids = list(dict.fromkeys(selected_post_ids))
 
             if not selected_post_ids:
                 return {"success": False, "message": "No posts found."}
 
-            # Fetch full post data
+            # Fetch full post data - preserve ranking order from EdgeRank
             placeholders = ", ".join("?" for _ in selected_post_ids)
+            
+            # Use CASE to preserve the EdgeRank order from rec table
+            order_cases = ", ".join(
+                f"WHEN post_id = ? THEN {i}" 
+                for i in range(len(selected_post_ids))
+            )
             post_query = (
                 f"SELECT post_id, user_id, original_post_id, content, "
                 f"quote_content, created_at, num_likes, num_dislikes, "
                 f"num_shares FROM post WHERE post_id IN ({placeholders}) "
-                f"ORDER BY created_at DESC")
-            self.pl_utils._execute_db_command(post_query, selected_post_ids)
+                f"ORDER BY CASE {order_cases} END")
+            # Double the selected_post_ids: once for IN clause, once for ORDER BY CASE
+            self.pl_utils._execute_db_command(
+                post_query, selected_post_ids + selected_post_ids)
             results = self.db_cursor.fetchall()
 
             if not results:
@@ -405,7 +464,11 @@ class Platform:
 
             results_with_comments = self.pl_utils._add_comments_to_posts(results)
 
-            action_info = {"posts": results_with_comments, "feed_type": "facebook"}
+            action_info = {
+                "posts": results_with_comments, 
+                "feed_type": "facebook_edgerank",
+                "ranking_method": "EdgeRank (Affinity × Weight × Decay)"
+            }
             self.pl_utils._record_trace(user_id, ActionType.REFRESH.value,
                                         action_info, current_time)
 
@@ -464,6 +527,32 @@ class Platform:
         elif self.recsys_type == RecsysType.REDDIT:
             new_rec_matrix = rec_sys_reddit(post_table, rec_matrix,
                                             self.max_rec_post_len)
+        elif self.recsys_type == RecsysType.FACEBOOK:
+            # Facebook EdgeRank-based recommendation system
+            # Based on Kincaid (2010): EdgeRank = Σ (Affinity × Weight × Decay)
+            # Enhanced with TwHIN content similarity
+            try:
+                friendship_table = fetch_table_from_db(self.db_cursor, "friendship")
+                group_members_table = fetch_table_from_db(self.db_cursor, "group_members")
+                group_post_table = fetch_table_from_db(self.db_cursor, "group_post")
+                
+                new_rec_matrix = rec_sys_facebook_edgerank(
+                    user_table=user_table,
+                    post_table=post_table,
+                    friendship_table=friendship_table,
+                    group_members_table=group_members_table,
+                    group_post_table=group_post_table,
+                    rec_matrix=rec_matrix,
+                    max_rec_post_len=self.max_rec_post_len,
+                    current_time=self.sandbox_clock.get_time_step(),
+                    use_content_similarity=True,
+                    alpha=0.3,
+                )
+            except Exception as e:
+                twitter_log.error(f"EdgeRank recommendation failed: {e}")
+                # Fallback to Reddit-style hot score
+                new_rec_matrix = rec_sys_reddit(post_table, rec_matrix,
+                                                self.max_rec_post_len)
         else:
             raise ValueError("Unsupported recommendation system type, please "
                              "check the `RecsysType`.")
@@ -486,7 +575,7 @@ class Platform:
         )
 
     async def create_post(self, agent_id: int, content: str):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -516,7 +605,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def repost(self, agent_id: int, post_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -591,7 +680,7 @@ class Platform:
 
     async def quote_post(self, agent_id: int, quote_message: tuple):
         post_id, quote_content = quote_message
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -649,7 +738,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def like_post(self, agent_id: int, post_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -753,7 +842,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def dislike_post(self, agent_id: int, post_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -945,7 +1034,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def follow(self, agent_id: int, followee_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1052,7 +1141,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def mute(self, agent_id: int, mutee_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1119,7 +1208,7 @@ class Platform:
         """
         Get the top K trending posts in the last num_days days.
         """
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1127,7 +1216,7 @@ class Platform:
         try:
             user_id = agent_id
             # Calculate the start time for the search
-            if self.recsys_type == RecsysType.REDDIT:
+            if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
                 start_time = current_time - timedelta(days=self.trend_num_days)
             else:
                 start_time = int(current_time) - self.trend_num_days * 24 * 60
@@ -1166,7 +1255,7 @@ class Platform:
 
     async def create_comment(self, agent_id: int, comment_message: tuple):
         post_id, content = comment_message
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1199,7 +1288,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def like_comment(self, agent_id: int, comment_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1307,7 +1396,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def dislike_comment(self, agent_id: int, comment_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1366,7 +1455,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def undo_dislike_comment(self, agent_id: int, comment_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1418,7 +1507,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def do_nothing(self, agent_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1444,7 +1533,7 @@ class Platform:
         Returns:
             dict: A dictionary with success status.
         """
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1481,7 +1570,7 @@ class Platform:
 
     async def report_post(self, agent_id: int, report_message: tuple):
         post_id, report_reason = report_message
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1535,7 +1624,7 @@ class Platform:
 
     async def send_to_group(self, agent_id: int, message: tuple):
         group_id, content = message
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1583,7 +1672,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def create_group(self, agent_id: int, group_name: str):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1617,7 +1706,7 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def join_group(self, agent_id: int, group_id: int):
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
@@ -1733,7 +1822,7 @@ class Platform:
 
     def _get_current_time(self):
         """Helper method to get current time based on recsys type."""
-        if self.recsys_type == RecsysType.REDDIT:
+        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             return self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:

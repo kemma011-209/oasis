@@ -795,3 +795,224 @@ def rec_sys_personalized_with_trace(
     end_time = time.time()
     print(f'Personalized recommendation time: {end_time - start_time:.6f}s')
     return new_rec_matrix
+
+
+def rec_sys_facebook_edgerank(
+    user_table: List[Dict[str, Any]],
+    post_table: List[Dict[str, Any]],
+    friendship_table: List[Dict[str, Any]],
+    group_members_table: List[Dict[str, Any]],
+    group_post_table: List[Dict[str, Any]],
+    rec_matrix: List[List],
+    max_rec_post_len: int,
+    current_time: int,
+    use_content_similarity: bool = True,
+    alpha: float = 0.3,
+) -> List[List]:
+    """
+    EdgeRank-based recommendation system for Facebook-style feed ranking.
+    
+    Based on Facebook's documented EdgeRank algorithm (Kincaid, 2010):
+        EdgeRank = Σ (Affinity × Weight × Decay)
+    
+    Enhanced with optional TwHIN content similarity (El-Kishky et al., 2022).
+    
+    Args:
+        user_table: List of user records with user_id, bio, etc.
+        post_table: List of post records with post_id, user_id, content, 
+                    num_likes, num_dislikes, num_shares, created_at.
+        friendship_table: List of friendship records with user_id_1, user_id_2.
+        group_members_table: List of group membership records with group_id, agent_id.
+        group_post_table: List of group post links with group_id, post_id.
+        rec_matrix: Existing recommendation matrix to update.
+        max_rec_post_len: Maximum number of posts to recommend per user.
+        current_time: Current simulation time for decay calculation.
+        use_content_similarity: Whether to include TwHIN embedding similarity.
+        alpha: Weight for content similarity contribution (default 0.3).
+    
+    Returns:
+        List[List]: Updated recommendation matrix with ranked post IDs per user.
+    
+    References:
+        - Kincaid, J. (2010). "EdgeRank: The Secret Sauce That Makes 
+          Facebook's News Feed Tick". TechCrunch.
+        - Backstrom et al. (2011). "Center of Attention: How Facebook Users 
+          Allocate Attention Across Friends". ICWSM-11.
+        - El-Kishky et al. (2022). "TwHIN: Embedding the Twitter Heterogeneous 
+          Information Network". KDD '22.
+    """
+    global model
+    
+    rec_log.info(f"Running Facebook EdgeRank recommendation for {len(user_table)} users...")
+    start_time = time.time()
+    
+    # Build lookup structures for efficient access
+    # Friend lookup: user_id -> set of friend user_ids
+    friend_lookup = {}
+    for friendship in friendship_table:
+        uid1 = friendship['user_id_1']
+        uid2 = friendship['user_id_2']
+        if uid1 not in friend_lookup:
+            friend_lookup[uid1] = set()
+        if uid2 not in friend_lookup:
+            friend_lookup[uid2] = set()
+        friend_lookup[uid1].add(uid2)
+        friend_lookup[uid2].add(uid1)
+    
+    # Group membership lookup: user_id -> set of group_ids
+    user_groups = {}
+    for membership in group_members_table:
+        user_id = membership.get('agent_id') or membership.get('user_id')
+        group_id = membership['group_id']
+        if user_id not in user_groups:
+            user_groups[user_id] = set()
+        user_groups[user_id].add(group_id)
+    
+    # Post to group lookup: post_id -> group_id
+    post_group = {}
+    for gp in group_post_table:
+        post_group[gp['post_id']] = gp['group_id']
+    
+    # Prepare content similarity if enabled
+    content_similarities = None
+    if use_content_similarity and len(post_table) > 0:
+        try:
+            if model is None:
+                model = get_recsys_model(recsys_type="twitter")
+            
+            # Get user bios and post contents
+            user_bios = [
+                user['bio'] if user.get('bio') else 'No profile'
+                for user in user_table
+            ]
+            post_contents = [post['content'] for post in post_table]
+            
+            if model and len(user_bios) > 0 and len(post_contents) > 0:
+                user_embeddings = model.encode(user_bios, 
+                                               convert_to_tensor=True,
+                                               device=device)
+                post_embeddings = model.encode(post_contents,
+                                               convert_to_tensor=True,
+                                               device=device)
+                
+                # Compute cosine similarity matrix
+                dot_product = torch.matmul(user_embeddings, post_embeddings.T)
+                user_norms = torch.norm(user_embeddings, dim=1)
+                post_norms = torch.norm(post_embeddings, dim=1)
+                content_similarities = (dot_product / 
+                                        (user_norms[:, None] * post_norms[None, :]))
+                content_similarities = content_similarities.cpu().numpy()
+        except Exception as e:
+            rec_log.warning(f"Content similarity calculation failed: {e}")
+            content_similarities = None
+    
+    # Build post lookup for fast access
+    post_lookup = {post['post_id']: post for post in post_table}
+    post_ids = [post['post_id'] for post in post_table]
+    
+    new_rec_matrix = []
+    
+    # If few posts, return all to everyone
+    if len(post_ids) <= max_rec_post_len:
+        new_rec_matrix = [post_ids] * len(rec_matrix)
+        end_time = time.time()
+        rec_log.info(f"EdgeRank recommendation time: {end_time - start_time:.6f}s")
+        return new_rec_matrix
+    
+    # Calculate EdgeRank scores for each user
+    for user_idx, user in enumerate(user_table):
+        user_id = user['user_id']
+        user_friend_ids = friend_lookup.get(user_id, set())
+        user_group_ids = user_groups.get(user_id, set())
+        
+        post_scores = []
+        
+        for post_idx, post in enumerate(post_table):
+            post_id = post['post_id']
+            post_author = post['user_id']
+            
+            # Skip user's own posts in recommendations
+            if post_author == user_id:
+                continue
+            
+            # === AFFINITY SCORE ===
+            # Based on Kincaid (2010): relationship strength with content creator
+            affinity = 1.0
+            
+            # Friend bonus (1.5x for friends)
+            if post_author in user_friend_ids:
+                affinity = 1.5
+            
+            # Group membership bonus (1.2x if post is in a shared group)
+            post_group_id = post_group.get(post_id)
+            if post_group_id and post_group_id in user_group_ids:
+                affinity *= 1.2
+            
+            # === WEIGHT SCORE ===
+            # Based on Kincaid (2010): type of content and engagement signals
+            # Based on Lada et al. (2021): engagement prediction as ranking signal
+            weight = 1.0
+            
+            num_likes = post.get('num_likes', 0) or 0
+            num_dislikes = post.get('num_dislikes', 0) or 0
+            num_shares = post.get('num_shares', 0) or 0
+            
+            # Engagement signals contribute to weight
+            # Comments weighted higher than likes (per Kincaid, 2010)
+            weight += num_likes * 0.01
+            weight += num_shares * 0.03  # Shares indicate high value
+            # Net positive engagement
+            weight += max(0, (num_likes - num_dislikes)) * 0.005
+            
+            # === DECAY SCORE ===
+            # Time decay based on post age
+            try:
+                if isinstance(post['created_at'], str):
+                    # Parse string timestamp
+                    try:
+                        created_at = datetime.strptime(post['created_at'], 
+                                                       "%Y-%m-%d %H:%M:%S.%f")
+                    except ValueError:
+                        created_at = datetime.strptime(post['created_at'],
+                                                       "%Y-%m-%d %H:%M:%S")
+                    # Calculate age in seconds
+                    post_age = (datetime.now() - created_at).total_seconds() / 3600
+                else:
+                    # Assume integer timestep
+                    post_age = current_time - int(post['created_at'])
+            except Exception:
+                post_age = 0
+            
+            # Logarithmic decay (from OASIS implementation)
+            # Posts older than ~270 timesteps get minimal score
+            if post_age < 271:
+                decay = log((271.8 - post_age) / 100)
+                decay = max(0.1, decay)  # Floor to prevent negative scores
+            else:
+                decay = 0.1
+            
+            # === EDGERANK SCORE ===
+            edgerank_score = affinity * weight * decay
+            
+            # === CONTENT SIMILARITY ENHANCEMENT ===
+            # Based on El-Kishky et al. (2022): TwHIN embeddings
+            if content_similarities is not None and use_content_similarity:
+                try:
+                    similarity = content_similarities[user_idx, post_idx]
+                    # Add weighted similarity to EdgeRank score
+                    edgerank_score += alpha * max(0, similarity)
+                except (IndexError, TypeError):
+                    pass
+            
+            post_scores.append((post_id, edgerank_score))
+        
+        # Sort by score (highest first) and take top N
+        post_scores.sort(key=lambda x: x[1], reverse=True)
+        top_post_ids = [pid for pid, _ in post_scores[:max_rec_post_len]]
+        
+        new_rec_matrix.append(top_post_ids)
+    
+    end_time = time.time()
+    rec_log.info(f"EdgeRank recommendation time: {end_time - start_time:.6f}s")
+    
+    return new_rec_matrix
