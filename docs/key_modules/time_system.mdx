@@ -1,0 +1,277 @@
+---
+title: Time System
+description: Understanding OASIS's virtual simulation time
+---
+
+# Time System
+
+OASIS provides two approaches to time management in simulations: the legacy `Clock` class and the new `VirtualClock` class. This document explains how time works in OASIS simulations and when to use each approach.
+
+## Overview
+
+Simulation time in OASIS is fundamentally different from wall-clock (real-world) time. The simulation advances in discrete **ticks**, where each tick represents a unit of simulated time during which agents can perform actions.
+
+### Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Tick** | A discrete simulation step (e.g., `env.step()` call) |
+| **Tick Duration** | How much simulated time each tick represents (e.g., 1 day = 86400 seconds) |
+| **Virtual Time** | The internal simulation clock, measured in seconds since an epoch |
+| **Causality** | Ensuring dependent events (like comments) always come after their parent events (like posts) |
+
+## VirtualClock (Recommended for Facebook)
+
+The `VirtualClock` class provides a deterministic, internal time system that is completely decoupled from wall-clock time. This is the recommended approach for Facebook simulations.
+
+### Features
+
+- **Deterministic**: Same seed produces same timestamps across runs
+- **Within-tick variation**: Multiple events in the same tick get different timestamps
+- **Causality enforcement**: Dependent events always have later timestamps
+- **Human-readable export**: Convert virtual timestamps to datetime for analysis
+
+### Configuration
+
+```python
+from oasis.clock import VirtualClock
+
+clock = VirtualClock(
+    tick_duration_s=86400,  # 1 tick = 1 day (in seconds)
+    epoch=datetime(2024, 1, 1),  # Virtual time 0 = Jan 1, 2024
+    seed=42,  # For reproducible randomness
+)
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `tick_duration_s` | 86400 | Duration of each tick in virtual seconds. Default is 1 day. |
+| `epoch` | 2024-01-01 | The datetime that virtual time 0 maps to |
+| `seed` | 42 | Random seed for deterministic timestamp generation |
+
+### How It Works
+
+1. **Tick-Based Time**: Time only advances when you call `advance_tick()` (typically at the end of `env.step()`).
+
+2. **Within-Tick Timestamps**: Each event gets a unique timestamp within the tick's time range:
+   - Tick 0: timestamps from 0 to 86399 seconds
+   - Tick 1: timestamps from 86400 to 172799 seconds
+   - And so on...
+
+3. **Causality**: When creating dependent events (e.g., a comment on a post), the system ensures the comment's timestamp is always greater than the post's timestamp.
+
+### Example Usage
+
+```python
+# Create clock with 1 tick = 1 day
+clock = VirtualClock(tick_duration_s=86400, seed=42)
+
+# Tick 0: Generate event times
+post_time = clock.event_time(agent_id=1, action_hint="create_post")
+# e.g., 45234 (somewhere in day 0)
+
+# Comment must come after the post (causality enforced)
+comment_time = clock.event_time(
+    agent_id=2, 
+    parent_time=post_time, 
+    action_hint="create_comment"
+)
+# e.g., 45235 (guaranteed to be > post_time)
+
+# Advance to next tick
+clock.advance_tick()
+# Now in tick 1, timestamps will be in range [86400, 172799]
+
+# Convert to human-readable datetime
+print(clock.to_datetime(post_time))
+# Output: 2024-01-01 12:33:54 (example)
+```
+
+### Why VirtualClock?
+
+| Benefit | Explanation |
+|---------|-------------|
+| **Reproducibility** | Same seed = same simulation results, regardless of execution speed |
+| **Meaningful Time** | Each tick has semantic meaning (e.g., "one simulated day") |
+| **Causality** | Comments always come after posts, reactions after the content they react to |
+| **No Race Conditions** | Time doesn't depend on when code executes |
+
+## Legacy Clock
+
+The original `Clock` class provides two modes:
+
+### 1. Time Step Counter (Twitter)
+
+For Twitter simulations, time is a simple integer counter:
+
+```python
+clock = Clock(k=60)  # k is magnification factor (unused in this mode)
+clock.time_step  # Integer counter (0, 1, 2, ...)
+```
+
+Each `env.step()` increments `time_step` by 1. Timestamps in the database are stored as this integer.
+
+### 2. Wall-Clock Based (Reddit)
+
+For Reddit simulations, time is based on actual elapsed wall-clock time:
+
+```python
+clock = Clock(k=60)  # k=60 means 1 real second = 60 simulated seconds
+simulated_time = clock.time_transfer(datetime.now(), start_time)
+```
+
+This approach has limitations:
+- Non-deterministic (depends on execution speed)
+- Difficult to reproduce exactly
+- Time advances even when simulation is paused
+
+## Platform-Specific Behavior
+
+### Twitter
+- Uses simple `time_step` counter (integers: 0, 1, 2, ...)
+- Each step = 1 timestep unit (often interpreted as minutes)
+- `env.step()` automatically increments `time_step`
+
+### Reddit
+- Uses `time_transfer()` with wall-clock time
+- Timestamps are datetime objects
+- Time advances based on real elapsed time
+
+### Facebook
+- **Now uses `VirtualClock`** (as of this update)
+- Timestamps are integers (seconds since epoch)
+- Deterministic, reproducible, with causality enforcement
+- Each `env.step()` advances the tick
+
+## Causality Enforcement
+
+The VirtualClock automatically ensures that dependent events have correct temporal ordering:
+
+```
+Post created at time T
+    └── Comment must be at time > T
+    └── Reaction must be at time > T
+    └── Reply must be at time > T
+```
+
+This is handled automatically in platform methods like:
+- `create_comment()` - looks up parent post's `created_at`
+- `react_to_post()` - ensures reaction is after post
+- All dependent actions pass `parent_time` to `_get_current_time()`
+
+## Migration Guide
+
+### Existing Code
+
+If you have existing Facebook simulation code, it should work without changes. The `VirtualClock` is backward-compatible with the `Clock` interface:
+
+```python
+# These still work:
+clock.time_step  # Returns current tick (integer)
+clock.get_time_step()  # Returns tick as string
+clock.time_transfer(...)  # Returns datetime (for compatibility)
+```
+
+### Database Timestamps
+
+With VirtualClock, timestamps in the database are:
+- **Type**: INTEGER (virtual seconds since epoch)
+- **Format**: Large integers like `45234`, `86400`, etc.
+- **Conversion**: Use `clock.to_datetime(timestamp)` to get human-readable datetime
+
+### Best Practices
+
+1. **Use VirtualClock for Facebook**: Provides better reproducibility and determinism
+
+2. **Don't rely on real time**: Avoid using `datetime.now()` in simulation logic
+
+3. **Always pass parent_time**: When creating dependent events, pass the parent's timestamp
+
+4. **Use consistent seeds**: Set the same seed for reproducible simulations
+
+## API Reference
+
+### VirtualClock Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `advance_tick(n=1)` | None | Advance simulation by n ticks |
+| `event_time(agent_id, parent_time, action_hint)` | int | Generate timestamp for an event |
+| `to_datetime(virtual_time_s)` | datetime | Convert virtual time to datetime |
+| `to_iso_string(virtual_time_s)` | str | Convert to ISO format string |
+| `from_datetime(dt)` | int | Convert datetime to virtual time |
+| `tick_start_s()` | int | Start of current tick in seconds |
+| `tick_end_s()` | int | End of current tick in seconds |
+| `reset()` | None | Reset clock to initial state |
+
+### VirtualClock Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `tick` | int | Current tick number |
+| `time_step` | int | Alias for `tick` (backward compatibility) |
+| `tick_duration_s` | int | Duration per tick in seconds |
+| `epoch` | datetime | The epoch datetime |
+| `seed` | int | Random seed |
+
+## Examples
+
+### Basic Facebook Simulation
+
+```python
+from oasis import OasisEnv, DefaultPlatformType, AgentGraph
+
+# VirtualClock is automatically used for Facebook
+env = OasisEnv(
+    agent_graph=agent_graph,
+    platform=DefaultPlatformType.FACEBOOK,
+    database_path="facebook_sim.db"
+)
+
+await env.reset()
+
+# Each step advances the virtual clock by 1 tick
+for _ in range(10):
+    await env.step(actions)
+    print(f"Now at tick: {env.platform.sandbox_clock.tick}")
+```
+
+### Custom VirtualClock Configuration
+
+```python
+from oasis.clock import VirtualClock
+from oasis.social_platform import Platform, Channel
+
+# Create custom clock (1 tick = 1 hour)
+clock = VirtualClock(
+    tick_duration_s=3600,  # 1 hour
+    seed=12345,
+)
+
+platform = Platform(
+    db_path="simulation.db",
+    channel=Channel(),
+    sandbox_clock=clock,
+    recsys_type="facebook",
+)
+```
+
+### Inspecting Timestamps
+
+```python
+# After simulation, inspect timestamps
+import sqlite3
+
+conn = sqlite3.connect("facebook_sim.db")
+cursor = conn.cursor()
+
+cursor.execute("SELECT post_id, user_id, created_at FROM post LIMIT 5")
+for row in cursor.fetchall():
+    post_id, user_id, created_at = row
+    # Convert integer timestamp to datetime
+    dt = env.platform.sandbox_clock.to_datetime(int(created_at))
+    print(f"Post {post_id} by user {user_id}: {dt}")
+```
+

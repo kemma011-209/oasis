@@ -200,11 +200,14 @@ class PlatformUtils:
         If only the trace table needs to record time, use the entry time into
         _record_trace as the time for the trace record.
         """
-        if self.recsys_type == RecsysType.REDDIT:
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        # Use passed current_time if available (ensures consistency with action)
+        if current_time is None:
+            # Fallback: generate time based on recsys type
+            if self.recsys_type == RecsysType.REDDIT:
+                current_time = self.sandbox_clock.time_transfer(
+                    datetime.now(), self.start_time)
+            else:
+                current_time = self.sandbox_clock.get_time_step()
 
         trace_insert_query = (
             "INSERT INTO trace (user_id, created_at, action, info) "

@@ -36,7 +36,8 @@
               "key_modules/models",
               "key_modules/toolkits",
               "key_modules/platform",
-              "key_modules/actions"
+              "key_modules/actions",
+              "key_modules/time_system"
             ]
           },
           {

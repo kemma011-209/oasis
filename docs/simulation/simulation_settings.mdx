@@ -9,7 +9,36 @@ OASIS provides powerful tools for running social media simulations with AI agent
 
 ## Time Settings
 
-OASIS supports flexible time handling for simulations through the `Clock` class. This allows you to control how time progresses in your simulation.
+OASIS supports flexible time handling for simulations through two clock classes:
+
+- **`VirtualClock`** (Recommended for Facebook): Deterministic, internal simulation time with causality enforcement
+- **`Clock`** (Legacy): Wall-clock based time with magnification factor
+
+For detailed documentation on the time system, see the [Time System](/key_modules/time_system) page.
+
+### VirtualClock (Facebook - Recommended)
+
+```python
+from oasis.clock import VirtualClock
+from datetime import datetime
+
+# Create a virtual clock with 1 tick = 1 day
+sandbox_clock = VirtualClock(
+    tick_duration_s=86400,  # 1 day in seconds
+    seed=42,  # For reproducible simulations
+)
+
+# Create a platform with the virtual clock
+platform = Platform(
+    db_path="./data/simulation.db",
+    channel=channel,
+    sandbox_clock=sandbox_clock,
+    recsys_type="facebook",
+    # Additional parameters...
+)
+```
+
+### Legacy Clock (Twitter/Reddit)
 
 ```python
 from oasis.clock.clock import Clock
@@ -29,6 +58,16 @@ platform = Platform(
 ```
 
 ### Clock Parameters
+
+#### VirtualClock Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `tick_duration_s` | `int` | Duration of each tick in seconds (default: 86400 = 1 day) |
+| `epoch` | `datetime` | The datetime that virtual time 0 maps to (default: 2024-01-01) |
+| `seed` | `int` | Random seed for deterministic timestamps (default: 42) |
+
+#### Legacy Clock Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|

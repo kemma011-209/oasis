@@ -966,25 +966,47 @@ def rec_sys_facebook_edgerank(
             
             # === DECAY SCORE ===
             # Time decay based on post age
+            # For VirtualClock: current_time and created_at are both integers (seconds)
+            # For legacy systems: current_time might be timestep count, created_at might be datetime string
             try:
-                if isinstance(post['created_at'], str):
-                    # Parse string timestamp
+                created_at_val = post['created_at']
+                
+                if isinstance(created_at_val, (int, float)):
+                    # Integer timestamp (VirtualClock seconds or Twitter timesteps)
+                    # Calculate age in hours for decay formula
+                    if isinstance(current_time, int) and current_time > 100000:
+                        # VirtualClock: timestamps are seconds since epoch
+                        post_age_seconds = max(0, int(current_time) - int(created_at_val))
+                        post_age = post_age_seconds / 3600  # Convert to hours
+                    else:
+                        # Twitter: timestamps are simple timestep counts
+                        post_age = max(0, int(current_time) - int(created_at_val))
+                elif isinstance(created_at_val, str):
+                    # Try parsing as integer string first (common for Facebook with VirtualClock)
                     try:
-                        created_at = datetime.strptime(post['created_at'], 
-                                                       "%Y-%m-%d %H:%M:%S.%f")
+                        created_at_int = int(created_at_val)
+                        if isinstance(current_time, int) and current_time > 100000:
+                            post_age_seconds = max(0, int(current_time) - created_at_int)
+                            post_age = post_age_seconds / 3600
+                        else:
+                            post_age = max(0, int(current_time) - created_at_int)
                     except ValueError:
-                        created_at = datetime.strptime(post['created_at'],
-                                                       "%Y-%m-%d %H:%M:%S")
-                    # Calculate age in seconds
-                    post_age = (datetime.now() - created_at).total_seconds() / 3600
+                        # Parse as datetime string (Reddit style)
+                        try:
+                            created_at = datetime.strptime(created_at_val, 
+                                                           "%Y-%m-%d %H:%M:%S.%f")
+                        except ValueError:
+                            created_at = datetime.strptime(created_at_val,
+                                                           "%Y-%m-%d %H:%M:%S")
+                        # For datetime-based time, use datetime.now() for decay
+                        post_age = (datetime.now() - created_at).total_seconds() / 3600
                 else:
-                    # Assume integer timestep
-                    post_age = current_time - int(post['created_at'])
+                    post_age = 0
             except Exception:
                 post_age = 0
             
             # Logarithmic decay (from OASIS implementation)
-            # Posts older than ~270 timesteps get minimal score
+            # Posts older than ~270 hours get minimal score
             if post_age < 271:
                 decay = log((271.8 - post_age) / 100)
                 decay = max(0.1, decay)  # Floor to prevent negative scores

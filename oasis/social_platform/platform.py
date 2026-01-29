@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from oasis.clock.clock import Clock
+from oasis.clock.virtual_clock import VirtualClock
 from oasis.social_platform.channel import Channel
 from oasis.social_platform.database import (create_db,
                                             fetch_rec_table_as_matrix,
@@ -177,25 +178,42 @@ class Platform:
         asyncio.run(self.running())
 
     async def sign_up(self, agent_id, user_message):
-        user_name, name, bio = user_message
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
+        # Phase 3A: Support optional profile_image_prompt and cover_image_prompt
+        # Backwards compatible: accepts (user_name, name, bio) or 
+        # (user_name, name, bio, profile_image_prompt, cover_image_prompt)
+        if len(user_message) >= 5:
+            user_name, name, bio, profile_image_prompt, cover_image_prompt = user_message[:5]
+        elif len(user_message) >= 4:
+            user_name, name, bio, profile_image_prompt = user_message[:4]
+            cover_image_prompt = None
         else:
-            current_time = self.sandbox_clock.get_time_step()
+            user_name, name, bio = user_message[:3]
+            profile_image_prompt = None
+            cover_image_prompt = None
+            
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="sign_up")
         try:
             user_insert_query = (
                 "INSERT INTO user (user_id, agent_id, user_name, name, "
-                "bio, created_at, num_followings, num_followers) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?)")
+                "bio, created_at, num_followings, num_followers, "
+                "profile_image_prompt, cover_image_prompt) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             self.pl_utils._execute_db_command(
                 user_insert_query,
-                (agent_id, agent_id, user_name, name, bio, current_time, 0, 0),
+                (agent_id, agent_id, user_name, name, bio, current_time, 0, 0,
+                 profile_image_prompt, cover_image_prompt),
                 commit=True,
             )
             user_id = agent_id
 
-            action_info = {"name": name, "user_name": user_name, "bio": bio}
+            action_info = {
+                "name": name, 
+                "user_name": user_name, 
+                "bio": bio,
+                "profile_image_prompt": profile_image_prompt,
+                "cover_image_prompt": cover_image_prompt
+            }
             self.pl_utils._record_trace(user_id, ActionType.SIGNUP.value,
                                         action_info, current_time)
             # twitter_log.info(f"Trace inserted: user_id={user_id}, "
@@ -220,11 +238,8 @@ class Platform:
 
     async def purchase_product(self, agent_id, purchase_message):
         product_name, purchase_num = purchase_message
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="purchase_product")
         # try:
         user_id = agent_id
         # Check if a like record already exists
@@ -258,11 +273,8 @@ class Platform:
 
     async def refresh(self, agent_id: int):
         # Retrieve posts for a specific id from the rec table
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="refresh")
         try:
             user_id = agent_id
 
@@ -311,10 +323,11 @@ class Platform:
 
             placeholders = ", ".join("?" for _ in selected_post_ids)
 
+            # Phase 3A: Include media_content in post results
             post_query = (
                 f"SELECT post_id, user_id, original_post_id, content, "
                 f"quote_content, created_at, num_likes, num_dislikes, "
-                f"num_shares FROM post WHERE post_id IN ({placeholders})")
+                f"num_shares, media_content FROM post WHERE post_id IN ({placeholders})")
             self.pl_utils._execute_db_command(post_query, selected_post_ids)
             results = self.db_cursor.fetchall()
             if not results:
@@ -449,10 +462,11 @@ class Platform:
                 f"WHEN post_id = ? THEN {i}" 
                 for i in range(len(selected_post_ids))
             )
+            # Phase 3A: Include media_content in post results
             post_query = (
                 f"SELECT post_id, user_id, original_post_id, content, "
                 f"quote_content, created_at, num_likes, num_dislikes, "
-                f"num_shares FROM post WHERE post_id IN ({placeholders}) "
+                f"num_shares, media_content FROM post WHERE post_id IN ({placeholders}) "
                 f"ORDER BY CASE {order_cases} END")
             # Double the selected_post_ids: once for IN clause, once for ORDER BY CASE
             self.pl_utils._execute_db_command(
@@ -536,6 +550,13 @@ class Platform:
                 group_members_table = fetch_table_from_db(self.db_cursor, "group_members")
                 group_post_table = fetch_table_from_db(self.db_cursor, "group_post")
                 
+                # For VirtualClock, use tick_end_s() to get integer seconds
+                # For legacy Clock, use get_time_step() (usually just the tick number)
+                if isinstance(self.sandbox_clock, VirtualClock):
+                    current_time_for_recsys = self.sandbox_clock.tick_end_s()
+                else:
+                    current_time_for_recsys = self.sandbox_clock.get_time_step()
+                
                 new_rec_matrix = rec_sys_facebook_edgerank(
                     user_table=user_table,
                     post_table=post_table,
@@ -544,7 +565,7 @@ class Platform:
                     group_post_table=group_post_table,
                     rec_matrix=rec_matrix,
                     max_rec_post_len=self.max_rec_post_len,
-                    current_time=self.sandbox_clock.get_time_step(),
+                    current_time=current_time_for_recsys,
                     use_content_similarity=True,
                     alpha=0.3,
                 )
@@ -574,24 +595,41 @@ class Platform:
             commit=True,
         )
 
-    async def create_post(self, agent_id: int, content: str):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
+    async def create_post(self, agent_id: int, content):
+        """Create a new post with optional media content (Phase 3A).
+        
+        Args:
+            agent_id: The ID of the agent creating the post
+            content: Either a string (text only) or tuple (text, media_content)
+                - String: "Hello world!" (text-only post)
+                - Tuple: ("Hello world!", "sunset image prompt") (post with media)
+        """
+        # Phase 3A: Support optional media_content via tuple
+        if isinstance(content, tuple):
+            text_content = content[0]
+            media_content = content[1] if len(content) > 1 else None
         else:
-            current_time = self.sandbox_clock.get_time_step()
+            text_content = content
+            media_content = None
+            
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="create_post")
         try:
             user_id = agent_id
 
             post_insert_query = (
                 "INSERT INTO post (user_id, content, created_at, num_likes, "
-                "num_dislikes, num_shares) VALUES (?, ?, ?, ?, ?, ?)")
+                "num_dislikes, num_shares, media_content) VALUES (?, ?, ?, ?, ?, ?, ?)")
             self.pl_utils._execute_db_command(
-                post_insert_query, (user_id, content, current_time, 0, 0, 0),
+                post_insert_query, (user_id, text_content, current_time, 0, 0, 0, media_content),
                 commit=True)
             post_id = self.db_cursor.lastrowid
 
-            action_info = {"content": content, "post_id": post_id}
+            action_info = {
+                "content": text_content, 
+                "post_id": post_id,
+                "media_content": media_content  # Phase 3A: track image prompts
+            }
             self.pl_utils._record_trace(user_id, ActionType.CREATE_POST.value,
                                         action_info, current_time)
 
@@ -605,11 +643,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def repost(self, agent_id: int, post_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="repost")
         try:
             user_id = agent_id
 
@@ -680,11 +715,8 @@ class Platform:
 
     async def quote_post(self, agent_id: int, quote_message: tuple):
         post_id, quote_content = quote_message
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="quote_post")
         try:
             user_id = agent_id
 
@@ -738,11 +770,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def like_post(self, agent_id: int, post_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="like_post")
         try:
             post_type_result = self.pl_utils._get_post_type(post_id)
             if post_type_result['type'] == 'repost':
@@ -842,11 +871,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def dislike_post(self, agent_id: int, post_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="dislike_post")
         try:
             post_type_result = self.pl_utils._get_post_type(post_id)
             if post_type_result['type'] == 'repost':
@@ -952,10 +978,11 @@ class Platform:
             user_id = agent_id
             # Update the SQL query to search by content, post_id, and user_id
             # simultaneously
+            # Phase 3A: Include media_content in search results
             sql_query = (
                 "SELECT post_id, user_id, original_post_id, content, "
                 "quote_content, created_at, num_likes, num_dislikes, "
-                "num_shares FROM post WHERE content LIKE ? OR CAST(post_id AS "
+                "num_shares, media_content FROM post WHERE content LIKE ? OR CAST(post_id AS "
                 "TEXT) LIKE ? OR CAST(user_id AS TEXT) LIKE ?")
             # Note: CAST is necessary because post_id and user_id are integers,
             # while the search query is a string type
@@ -1034,11 +1061,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def follow(self, agent_id: int, followee_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="follow")
         try:
             user_id = agent_id
             # Check if a follow record already exists
@@ -1141,11 +1165,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def mute(self, agent_id: int, mutee_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="mute")
         try:
             user_id = agent_id
             # Check if a mute record already exists
@@ -1208,24 +1229,26 @@ class Platform:
         """
         Get the top K trending posts in the last num_days days.
         """
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="trend")
         try:
             user_id = agent_id
             # Calculate the start time for the search
-            if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
+            if self.recsys_type == RecsysType.REDDIT:
+                # Reddit uses datetime-based time
                 start_time = current_time - timedelta(days=self.trend_num_days)
+            elif self.recsys_type == RecsysType.FACEBOOK:
+                # Facebook with VirtualClock uses seconds
+                start_time = int(current_time) - self.trend_num_days * 24 * 60 * 60
             else:
+                # Twitter uses minute-based timesteps
                 start_time = int(current_time) - self.trend_num_days * 24 * 60
 
-            # Build the SQL query
+            # Build the SQL query (Phase 3A: include media_content)
             sql_query = """
                 SELECT post_id, user_id, original_post_id, content,
                 quote_content, created_at, num_likes, num_dislikes,
-                num_shares FROM post
+                num_shares, media_content FROM post
                 WHERE created_at >= ?
                 ORDER BY num_likes DESC
                 LIMIT ?
@@ -1254,31 +1277,56 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def create_comment(self, agent_id: int, comment_message: tuple):
-        post_id, content = comment_message
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
+        """Create a comment on a post with optional media content (Phase 3A).
+        
+        Args:
+            agent_id: The ID of the agent creating the comment
+            comment_message: Tuple of (post_id, content) or (post_id, content, media_content)
+        """
+        # Phase 3A: Support optional media_content in comments
+        if len(comment_message) >= 3:
+            post_id, content, media_content = comment_message[:3]
         else:
-            current_time = self.sandbox_clock.get_time_step()
+            post_id, content = comment_message[:2]
+            media_content = None
+            
         try:
             post_type_result = self.pl_utils._get_post_type(post_id)
             if post_type_result['type'] == 'repost':
                 post_id = post_type_result['root_post_id']
             user_id = agent_id
 
-            # Insert the comment record
+            # Look up the post's created_at for causality enforcement
+            self.db_cursor.execute(
+                "SELECT created_at FROM post WHERE post_id = ?", (post_id,))
+            post_row = self.db_cursor.fetchone()
+            parent_time = None
+            if post_row and post_row[0] is not None:
+                try:
+                    parent_time = int(post_row[0])
+                except (ValueError, TypeError):
+                    parent_time = None  # Non-integer timestamp, skip causality
+            
+            current_time = self._get_current_time(
+                agent_id=agent_id, parent_time=parent_time, action_hint="create_comment")
+
+            # Insert the comment record with optional media_content (Phase 3A)
             comment_insert_query = (
-                "INSERT INTO comment (post_id, user_id, content, created_at) "
-                "VALUES (?, ?, ?, ?)")
+                "INSERT INTO comment (post_id, user_id, content, created_at, media_content) "
+                "VALUES (?, ?, ?, ?, ?)")
             self.pl_utils._execute_db_command(
                 comment_insert_query,
-                (post_id, user_id, content, current_time),
+                (post_id, user_id, content, current_time, media_content),
                 commit=True,
             )
             comment_id = self.db_cursor.lastrowid
 
             # Prepare information for the trace record
-            action_info = {"content": content, "comment_id": comment_id}
+            action_info = {
+                "content": content, 
+                "comment_id": comment_id,
+                "media_content": media_content  # Phase 3A: track image prompts
+            }
             self.pl_utils._record_trace(user_id,
                                         ActionType.CREATE_COMMENT.value,
                                         action_info, current_time)
@@ -1288,11 +1336,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def like_comment(self, agent_id: int, comment_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="like_comment")
         try:
             user_id = agent_id
 
@@ -1396,11 +1441,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def dislike_comment(self, agent_id: int, comment_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="dislike_comment")
         try:
             user_id = agent_id
 
@@ -1455,11 +1497,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def undo_dislike_comment(self, agent_id: int, comment_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="undo_dislike_comment")
         try:
             user_id = agent_id
 
@@ -1507,11 +1546,8 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def do_nothing(self, agent_id: int):
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="do_nothing")
         try:
             user_id = agent_id
 
@@ -1533,11 +1569,8 @@ class Platform:
         Returns:
             dict: A dictionary with success status.
         """
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="interview")
         try:
             user_id = agent_id
 
@@ -1570,11 +1603,8 @@ class Platform:
 
     async def report_post(self, agent_id: int, report_message: tuple):
         post_id, report_reason = report_message
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
-            current_time = self.sandbox_clock.time_transfer(
-                datetime.now(), self.start_time)
-        else:
-            current_time = self.sandbox_clock.get_time_step()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="report_post")
         try:
             user_id = agent_id
             post_type_result = self.pl_utils._get_post_type(post_id)
@@ -1671,7 +1701,23 @@ class Platform:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def create_group(self, agent_id: int, group_name: str):
+    async def create_group(self, agent_id: int, group_message):
+        """Create a new group with optional cover image (Phase 3A).
+        
+        Args:
+            agent_id: The ID of the agent creating the group
+            group_message: Either a string (name only) or tuple (name, cover_image_prompt)
+                - String: "My Group" (group without cover)
+                - Tuple: ("My Group", "group cover image prompt") (group with cover)
+        """
+        # Phase 3A: Support optional cover_image_prompt via tuple
+        if isinstance(group_message, tuple):
+            group_name = group_message[0]
+            cover_image_prompt = group_message[1] if len(group_message) > 1 else None
+        else:
+            group_name = group_message
+            cover_image_prompt = None
+            
         if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
             current_time = self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
@@ -1680,12 +1726,12 @@ class Platform:
         try:
             user_id = agent_id
 
-            # insert the group into the groups table
+            # insert the group into the groups table with optional cover image (Phase 3A)
             insert_query = """
-                INSERT INTO chat_group (name, created_at) VALUES (?, ?)
+                INSERT INTO chat_group (name, created_at, cover_image_prompt) VALUES (?, ?, ?)
             """
             self.pl_utils._execute_db_command(insert_query,
-                                              (group_name, current_time),
+                                              (group_name, current_time, cover_image_prompt),
                                               commit=True)
             group_id = self.db_cursor.lastrowid
 
@@ -1697,7 +1743,11 @@ class Platform:
             self.pl_utils._execute_db_command(
                 join_query, (group_id, user_id, current_time), commit=True)
 
-            action_info = {"group_id": group_id, "group_name": group_name}
+            action_info = {
+                "group_id": group_id, 
+                "group_name": group_name,
+                "cover_image_prompt": cover_image_prompt  # Phase 3A: track image prompts
+            }
             self.pl_utils._record_trace(user_id, ActionType.CREATE_GROUP.value,
                                         action_info, current_time)
 
@@ -1820,17 +1870,55 @@ class Platform:
 
     # ==================== Facebook-style methods ====================
 
-    def _get_current_time(self):
-        """Helper method to get current time based on recsys type."""
-        if self.recsys_type in (RecsysType.REDDIT, RecsysType.FACEBOOK):
+    def _get_current_time(
+        self,
+        agent_id: int = 0,
+        parent_time: int = None,
+        action_hint: str = ""
+    ):
+        """
+        Helper method to get current time based on recsys type.
+        
+        For Facebook with VirtualClock: Uses deterministic event_time() with
+        within-tick variation and causality enforcement.
+        
+        For Reddit: Uses datetime-based time_transfer().
+        
+        For Twitter/TWHIN: Uses simple time_step counter.
+        
+        Args:
+            agent_id: The agent performing the action (used for deterministic seeding).
+            parent_time: If this event depends on another (e.g., comment on post),
+                        pass the parent's created_at to enforce causality.
+            action_hint: Description of the action for deterministic seeding.
+        
+        Returns:
+            Time value appropriate for the platform type.
+        """
+        if self.recsys_type == RecsysType.FACEBOOK:
+            # Use VirtualClock's event_time for deterministic, causality-aware timestamps
+            if isinstance(self.sandbox_clock, VirtualClock):
+                return self.sandbox_clock.event_time(
+                    agent_id=agent_id,
+                    parent_time=parent_time,
+                    action_hint=action_hint
+                )
+            else:
+                # Fallback for legacy Clock with Facebook
+                return self.sandbox_clock.time_transfer(
+                    datetime.now(), self.start_time)
+        elif self.recsys_type == RecsysType.REDDIT:
+            # Reddit uses datetime-based time
             return self.sandbox_clock.time_transfer(
                 datetime.now(), self.start_time)
         else:
+            # Twitter/TWHIN use simple time_step counter
             return self.sandbox_clock.get_time_step()
 
     async def send_friend_request(self, agent_id: int, receiver_id: int):
         """Send a friend request to another user (Facebook-style)."""
-        current_time = self._get_current_time()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="send_friend_request")
         try:
             user_id = agent_id
 
@@ -1888,7 +1976,8 @@ class Platform:
 
     async def accept_friend_request(self, agent_id: int, request_id: int):
         """Accept a friend request, creating mutual friendship."""
-        current_time = self._get_current_time()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="accept_friend_request")
         try:
             user_id = agent_id
 
@@ -1938,7 +2027,8 @@ class Platform:
 
     async def reject_friend_request(self, agent_id: int, request_id: int):
         """Reject a friend request."""
-        current_time = self._get_current_time()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="reject_friend_request")
         try:
             user_id = agent_id
 
@@ -1970,7 +2060,8 @@ class Platform:
 
     async def unfriend(self, agent_id: int, friend_id: int):
         """Remove a mutual friendship."""
-        current_time = self._get_current_time()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="unfriend")
         try:
             user_id = agent_id
 
@@ -2089,7 +2180,6 @@ class Platform:
         if reaction_type not in valid_reactions:
             return {"success": False, "error": f"Invalid reaction. Use: {valid_reactions}"}
 
-        current_time = self._get_current_time()
         try:
             user_id = agent_id
 
@@ -2097,6 +2187,20 @@ class Platform:
             post_type_result = self.pl_utils._get_post_type(post_id)
             if post_type_result and post_type_result['type'] == 'repost':
                 post_id = post_type_result['root_post_id']
+
+            # Look up the post's created_at for causality enforcement
+            self.db_cursor.execute(
+                "SELECT created_at FROM post WHERE post_id = ?", (post_id,))
+            post_row = self.db_cursor.fetchone()
+            parent_time = None
+            if post_row and post_row[0] is not None:
+                try:
+                    parent_time = int(post_row[0])
+                except (ValueError, TypeError):
+                    parent_time = None  # Non-integer timestamp, skip causality
+
+            current_time = self._get_current_time(
+                agent_id=agent_id, parent_time=parent_time, action_hint="react_to_post")
 
             # Check if user already reacted
             check_query = "SELECT reaction_id, reaction_type FROM reaction WHERE post_id = ? AND user_id = ?"
@@ -2143,7 +2247,8 @@ class Platform:
 
     async def remove_reaction(self, agent_id: int, post_id: int):
         """Remove a reaction from a post."""
-        current_time = self._get_current_time()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="remove_reaction")
         try:
             user_id = agent_id
 
@@ -2182,9 +2287,21 @@ class Platform:
             return {"success": False, "error": str(e)}
 
     async def create_group_post(self, agent_id: int, group_post_message: tuple):
-        """Create a post visible only to group members."""
-        group_id, content = group_post_message
-        current_time = self._get_current_time()
+        """Create a post visible only to group members (Phase 3A: supports media).
+        
+        Args:
+            agent_id: The ID of the agent creating the post
+            group_post_message: Tuple of (group_id, content) or (group_id, content, media_content)
+        """
+        # Phase 3A: Support optional media_content in group posts
+        if len(group_post_message) >= 3:
+            group_id, content, media_content = group_post_message[:3]
+        else:
+            group_id, content = group_post_message[:2]
+            media_content = None
+            
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="create_group_post")
         try:
             user_id = agent_id
 
@@ -2194,12 +2311,12 @@ class Platform:
             if not self.db_cursor.fetchone():
                 return {"success": False, "error": "User is not a member of this group."}
 
-            # Create the post
+            # Create the post with optional media_content (Phase 3A)
             post_insert_query = (
                 "INSERT INTO post (user_id, content, created_at, num_likes, "
-                "num_dislikes, num_shares, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                "num_dislikes, num_shares, visibility, media_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             self.pl_utils._execute_db_command(
-                post_insert_query, (user_id, content, current_time, 0, 0, 0, 'public'),
+                post_insert_query, (user_id, content, current_time, 0, 0, 0, 'public', media_content),
                 commit=True)
             post_id = self.db_cursor.lastrowid
 
@@ -2212,8 +2329,13 @@ class Platform:
                 group_post_insert, (group_id, post_id, current_time), commit=True)
             group_post_id = self.db_cursor.lastrowid
 
-            action_info = {"group_id": group_id, "post_id": post_id, 
-                          "group_post_id": group_post_id, "content": content}
+            action_info = {
+                "group_id": group_id, 
+                "post_id": post_id, 
+                "group_post_id": group_post_id, 
+                "content": content,
+                "media_content": media_content  # Phase 3A: track image prompts
+            }
             self.pl_utils._record_trace(user_id, ActionType.CREATE_GROUP_POST.value,
                                         action_info, current_time)
 
@@ -2224,7 +2346,8 @@ class Platform:
     async def share_to_group(self, agent_id: int, share_message: tuple):
         """Share an existing post to a group."""
         post_id, group_id = share_message
-        current_time = self._get_current_time()
+        current_time = self._get_current_time(
+            agent_id=agent_id, action_hint="share_to_group")
         try:
             user_id = agent_id
 

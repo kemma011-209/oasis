@@ -17,6 +17,7 @@ import os
 from datetime import datetime
 from typing import List, Union
 
+from oasis.clock.virtual_clock import VirtualClock
 from oasis.environment.env_action import LLMAction, ManualAction
 from oasis.social_agent.agent import SocialAgent
 from oasis.social_agent.agent_graph import AgentGraph
@@ -59,7 +60,8 @@ class OasisEnv:
         Args:
             agent_graph: The AgentGraph to use in the simulation.
             platform: The platform type to use. Including
-                `DefaultPlatformType.TWITTER` or `DefaultPlatformType.REDDIT`.
+                `DefaultPlatformType.TWITTER`, `DefaultPlatformType.REDDIT`,
+                or `DefaultPlatformType.FACEBOOK`.
                 Or you can pass a custom `Platform` instance.
             database_path: The path to create a sqlite3 database. The file
                 extension must be `.db` such as `twitter_simulation.db`.
@@ -96,10 +98,29 @@ class OasisEnv:
                     refresh_rec_post_count=5,
                 )
                 self.platform_type = DefaultPlatformType.REDDIT
+            elif platform == DefaultPlatformType.FACEBOOK:
+                self.channel = Channel()
+                # Use VirtualClock for deterministic, internal simulation time
+                virtual_clock = VirtualClock(
+                    tick_duration_s=86400,  # 1 tick = 1 day
+                    seed=42,
+                )
+                self.platform = Platform(
+                    db_path=database_path,
+                    channel=self.channel,
+                    sandbox_clock=virtual_clock,
+                    recsys_type="facebook",
+                    allow_self_rating=True,
+                    show_score=False,
+                    max_rec_post_len=50,
+                    refresh_rec_post_count=10,
+                )
+                self.platform_type = DefaultPlatformType.FACEBOOK
             else:
                 raise ValueError(f"Invalid platform: {platform}. Only "
-                                 "DefaultPlatformType.TWITTER or "
-                                 "DefaultPlatformType.REDDIT are supported.")
+                                 "DefaultPlatformType.TWITTER, "
+                                 "DefaultPlatformType.REDDIT, or "
+                                 "DefaultPlatformType.FACEBOOK are supported.")
         elif isinstance(platform, Platform):
             if database_path != platform.db_path:
                 env_log.warning("database_path is not the same as the "
@@ -108,6 +129,8 @@ class OasisEnv:
             self.channel = platform.channel
             if platform.recsys_type == RecsysType.REDDIT:
                 self.platform_type = DefaultPlatformType.REDDIT
+            elif platform.recsys_type == RecsysType.FACEBOOK:
+                self.platform_type = DefaultPlatformType.FACEBOOK
             else:
                 self.platform_type = DefaultPlatformType.TWITTER
         else:
@@ -193,9 +216,14 @@ class OasisEnv:
         await asyncio.gather(*tasks)
         env_log.info("performed all actions.")
         # # Control some agents to perform actions
-        # Update the clock
-        if self.platform_type == DefaultPlatformType.TWITTER:
-            self.platform.sandbox_clock.time_step += 1
+        # Update the clock - advance tick for platforms using discrete time
+        if self.platform_type in (DefaultPlatformType.TWITTER,
+                                  DefaultPlatformType.FACEBOOK):
+            # For VirtualClock, use advance_tick(); for legacy Clock, increment time_step
+            if hasattr(self.platform.sandbox_clock, 'advance_tick'):
+                self.platform.sandbox_clock.advance_tick(1)
+            else:
+                self.platform.sandbox_clock.time_step += 1
 
     async def close(self) -> None:
         r"""Stop the platform and close the environment.
