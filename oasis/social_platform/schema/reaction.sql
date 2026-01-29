@@ -11,3 +11,4 @@ CREATE TABLE IF NOT EXISTS reaction (
     UNIQUE(post_id, user_id)  -- One reaction per user per post
 );
 
+

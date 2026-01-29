@@ -1,5 +1,5 @@
 -- This is the schema definition for the post table
--- Add Images, location etc.?
+-- Phase 3A: Added media_content for multimodal support (deferred image generation)
 CREATE TABLE post (
     post_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -12,6 +12,7 @@ CREATE TABLE post (
     num_shares INTEGER DEFAULT 0,  -- num_shares = num_reposts + num_quotes
     num_reports INTEGER DEFAULT 0,
     visibility TEXT DEFAULT 'public',  -- 'public', 'friends', 'private' (Facebook-style)
+    media_content TEXT DEFAULT NULL,  -- Optional image prompt (Phase 3A: faux image layer)
     FOREIGN KEY(user_id) REFERENCES user(user_id),
     FOREIGN KEY(original_post_id) REFERENCES post(post_id)
 );

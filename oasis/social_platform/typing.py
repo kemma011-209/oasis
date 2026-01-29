@@ -117,3 +117,4 @@ class RecsysType(Enum):
 class DefaultPlatformType(Enum):
     TWITTER = "twitter"
     REDDIT = "reddit"
+    FACEBOOK = "facebook"

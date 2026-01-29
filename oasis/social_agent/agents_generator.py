@@ -647,3 +647,61 @@ async def generate_twitter_agent_graph(
 
         agent_graph.add_agent(agent)
     return agent_graph
+
+
+async def generate_facebook_agent_graph(
+    profile_path: str,
+    model: Optional[Union[BaseModelBackend, List[BaseModelBackend],
+                          ModelManager]] = None,
+    available_actions: list[ActionType] = None,
+) -> AgentGraph:
+    """Generate an agent graph for Facebook-style social simulation.
+    
+    Args:
+        profile_path: Path to JSON file containing user profiles.
+        model: The model backend for agent reasoning.
+        available_actions: List of available actions for agents.
+        
+    Returns:
+        AgentGraph with Facebook-configured agents.
+    """
+    agent_graph = AgentGraph()
+    with open(profile_path, "r", encoding="utf-8-sig") as file:
+        agent_info = json.load(file)
+
+    async def process_agent(i):
+        # Instantiate an agent
+        profile = {
+            "nodes": [],  # Relationships with other agents
+            "edges": [],  # Relationship details
+            "other_info": {},
+        }
+        # Update agent profile with additional information
+        profile["other_info"]["user_profile"] = agent_info[i]["persona"]
+        profile["other_info"]["mbti"] = agent_info[i]["mbti"]
+        profile["other_info"]["gender"] = agent_info[i]["gender"]
+        profile["other_info"]["age"] = agent_info[i]["age"]
+        profile["other_info"]["country"] = agent_info[i]["country"]
+
+        user_info = UserInfo(
+            user_name=agent_info[i]["username"],
+            name=agent_info[i].get("realname", agent_info[i]["username"]),
+            description=agent_info[i]["bio"],
+            profile=profile,
+            recsys_type="facebook",
+        )
+
+        agent = SocialAgent(
+            agent_id=i,
+            user_info=user_info,
+            agent_graph=agent_graph,
+            model=model,
+            available_actions=available_actions,
+        )
+
+        # Add agent to the agent graph
+        agent_graph.add_agent(agent)
+
+    tasks = [process_agent(i) for i in range(len(agent_info))]
+    await asyncio.gather(*tasks)
+    return agent_graph

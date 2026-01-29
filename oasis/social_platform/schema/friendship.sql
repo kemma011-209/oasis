@@ -11,3 +11,4 @@ CREATE TABLE IF NOT EXISTS friendship (
     UNIQUE(user_id_1, user_id_2)
 );
 
+

@@ -11,3 +11,4 @@ CREATE TABLE IF NOT EXISTS friend_request (
     FOREIGN KEY(receiver_id) REFERENCES user(user_id)
 );
 
+

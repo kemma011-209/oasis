@@ -153,15 +153,21 @@ class SocialAction:
         """
         return await self.perform_action(None, ActionType.DO_NOTHING.value)
 
-    async def create_post(self, content: str):
-        r"""Create a new post with the given content.
+    async def create_post(self, content: str, media_content: str | None = None):
+        r"""Create a new post with the given content and optional image.
 
         This method invokes an asynchronous action to create a new post based
-        on the provided content. Upon successful execution, it returns a
-        dictionary indicating success and the ID of the newly created post.
+        on the provided content. Optionally, you can include an image by
+        providing a media_content parameter with a descriptive prompt for
+        the image to be generated.
 
         Args:
-            content (str): The content of the post to be created.
+            content (str): The text content of the post to be created.
+            media_content (str | None): Optional image prompt describing the
+                photo to attach. Should describe a realistic photo suitable
+                for social media (e.g., "A homemade pasta dish on a rustic
+                wooden table, steam rising, parmesan shavings"). If None,
+                the post will be text-only.
 
         Returns:
             dict: A dictionary with two key-value pairs. The 'success' key
@@ -172,7 +178,12 @@ class SocialAction:
             Example of a successful return:
             {'success': True, 'post_id': 50}
         """
-        return await self.perform_action(content, ActionType.CREATE_POST.value)
+        # If media_content provided, send as tuple for platform to handle
+        if media_content:
+            message = (content, media_content)
+        else:
+            message = content
+        return await self.perform_action(message, ActionType.CREATE_POST.value)
 
     async def repost(self, post_id: int):
         r"""Repost a specified post.

@@ -11,3 +11,4 @@ CREATE TABLE IF NOT EXISTS group_post (
     FOREIGN KEY(shared_by) REFERENCES user(user_id)
 );
 
+
